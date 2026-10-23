@@ -1,0 +1,40 @@
+# ---- secrets: never commit ----
+.env.local
+.env
+*.pem
+*.key
+
+# ---- experiment artifacts: hundreds of MB, regenerate by running ----
+runs/
+
+# ---- AEGIS working dirs (per-run scratch created by the engine) ----
+.harnessx/
+.harnessx-econ/
+.harnessx-rob/
+
+# ---- vendored binary dependencies: rebuilt per machine via pip ----
+.deps/
+.wheels/
+src/.pydeps/
+src/.wheels/
+
+# ---- corpora: auto-downloaded on first run ----
+# BRIGHT      -> python src/tools/fetch_bright.py
+# BEIR/BIRCO  -> fetched automatically by src/beir/data.py and src/birco/data.py
+data/
+
+# ---- HarnessX: reconstructed from patches/ (see README) ----
+third_party/HarnessX/
+
+# ---- scratch / caches ----
+.tmp/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+-p/
+
+# ---- stray output from interactive sessions ----
+inTrace
+trace
+out*.txt

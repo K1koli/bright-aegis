@@ -1,0 +1,27 @@
+{
+  "model": "Qwen3.5-9B",
+  "messages": [
+    {"role": "system", "content": "You are a retrieval agent. Use the Retrieve tool when asked to find passages."},
+    {"role": "user", "content": "Find passages about why insects are attracted to light."}
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "Retrieve",
+        "description": "Search the domain corpus and return the top-ranked passages.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {"type": "string", "description": "The search query."},
+            "k": {"type": "integer", "description": "How many passages to return."}
+          },
+          "required": ["query"]
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "max_tokens": 256,
+  "temperature": 0
+}

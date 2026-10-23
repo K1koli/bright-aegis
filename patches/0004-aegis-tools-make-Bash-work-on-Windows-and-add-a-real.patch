@@ -1,0 +1,235 @@
+From 4db851e4263f41f266da8899dbfc9cedcef07c23 Mon Sep 17 00:00:00 2001
+From: BRIGHT evolution experiment <experiment@local>
+Date: Wed, 14 Oct 2026 20:57:58 +0800
+Subject: [PATCH 4/6] aegis/tools: make Bash work on Windows and add a real
+ per-stage cost cap
+
+Two independent blockers, both found by reading what the meta-agents actually did.
+
+1. Bash was dead on Windows. _WORK_ROOT defaulted to the literal
+   '/tmp/harnessx-work', which on Windows is a drive-relative '\\tmp\\...' that
+   needs admin rights, so _get_work_dir() raised WinError 5 before any command
+   ran. Every Bash call in the BRIGHT pilot failed, so the Evolver could not run
+   the mandatory build->verify loop for new code and fell back to prompt-only
+   candidates -- silently disabling the tools and processor evolution buckets.
+   Fixed with a cross-platform default plus the existing HARNESSX_WORK_DIR
+   override.
+
+   Then the process still would not start: asyncio's Windows subprocess transport
+   is built on NAMED pipes, which some sandboxes forbid (bare WinError 5), while
+   subprocess.run() with anonymous pipes works. The blocking call now runs in a
+   worker thread. A shell probe (HARNESSX_BASH) prefers a real bash and falls
+   back to the platform default when MSYS2's signal pipe is unavailable.
+
+2. Cost had no effective brake. CostGuardProcessor ceilings were hard-coded to
+   \ per stage at four sites; the BRIGHT pilot spent \.5 in one round
+   (Evolver alone \.32 / 4.9M tokens / 63 steps). All sites now read
+   harnessx/aegis/budget.py: AEGIS_MAX_STAGE_COST_USD.
+   Note AegisAgent.budget_per_round_usd is accepted but never read, so it
+   enforces nothing.
+---
+ harnessx/aegis/budget.py            | 37 +++++++++++++++++
+ harnessx/aegis/orchestrator.py      |  7 ++--
+ harnessx/aegis/stages/preprocess.py |  3 +-
+ harnessx/tools/builtin/bash.py      | 63 +++++++++++++++++++++++------
+ 4 files changed, 93 insertions(+), 17 deletions(-)
+ create mode 100644 harnessx/aegis/budget.py
+
+diff --git a/harnessx/aegis/budget.py b/harnessx/aegis/budget.py
+new file mode 100644
+index 0000000..698f428
+--- /dev/null
++++ b/harnessx/aegis/budget.py
+@@ -0,0 +1,37 @@
++# Copyright 2026 Darwin-Agent
++# SPDX-License-Identifier: MIT
++"""Per-stage cost ceilings for the AEGIS meta-agents.
++
++Every meta stage (Digester / Planner / Evolver / Critic) runs with a
++``CostGuardProcessor`` whose ceiling was hard-coded to $100 in the orchestrator
++and in Stage P. That is a reasonable default for a frontier-model pilot, but it
++puts no effective brake on a stage that decides to iterate: in the BRIGHT pilot
++the Evolver alone ran 63 steps and spent $16.32, and the round totalled ~$27.5.
++
++This module makes the ceiling one env-var-controlled value so a driver can bound
++a whole run without patching the engine:
++
++    AEGIS_MAX_STAGE_COST_USD=6.0
++
++Note ``AegisAgent.budget_per_round_usd`` is NOT this knob: it is accepted and
++threaded through the public API but never read, so it enforces nothing. This is
++the ceiling the CostGuardProcessor actually enforces.
++"""
++from __future__ import annotations
++
++import os
++
++DEFAULT_STAGE_COST_USD = 100.0
++
++ENV_VAR = "AEGIS_MAX_STAGE_COST_USD"
++
++
++def max_stage_cost_usd() -> float:
++    """Cost ceiling for a single meta stage, from ``AEGIS_MAX_STAGE_COST_USD``."""
++    raw = os.environ.get(ENV_VAR)
++    if raw is None or not str(raw).strip():
++        return DEFAULT_STAGE_COST_USD
++    try:
++        return float(raw)
++    except (TypeError, ValueError):
++        return DEFAULT_STAGE_COST_USD
+diff --git a/harnessx/aegis/orchestrator.py b/harnessx/aegis/orchestrator.py
+index c4447f2..02168aa 100644
+--- a/harnessx/aegis/orchestrator.py
++++ b/harnessx/aegis/orchestrator.py
+@@ -12,6 +12,7 @@ from .data.journal import Journal, RoundEntry
+ from .data.archive import Archive
+ from .data.reputation import Reputation
+ from .data import ledger
++from .budget import max_stage_cost_usd
+ from .stages.preprocess import run_stage_p
+ from .stages.plan import run_stage_1
+ from .stages.propose import run_stage_2
+@@ -385,7 +386,7 @@ class AegisOrchestrator:
+             digests_dir=round_dir / "digests",
+             reputation_summary=self.reputation.to_dict(),
+             model_config=self.model_config,
+-            max_cost_usd=100.0,
++            max_cost_usd=max_stage_cost_usd(),
+             actionability_score=actionability,
+             run_root=self.run_dir,
+             sessions_dir=round_dir / "meta_sessions" / "planner",
+@@ -423,7 +424,7 @@ class AegisOrchestrator:
+             trajectories_dir=round_dir / "trajectories",
+             digests_dir=round_dir / "digests",
+             model_config=self.model_config,
+-            max_cost_usd=100.0,
++            max_cost_usd=max_stage_cost_usd(),
+             sessions_dir=round_dir / "meta_sessions" / "evolver",
+             benchmark_context=self.benchmark_context,
+         )
+@@ -487,7 +488,7 @@ class AegisOrchestrator:
+             evolver_runner=evolver_runner,
+             model_config=self.model_config,
+             max_ask_more=self.max_ask_more,
+-            max_cost_usd=100.0,
++            max_cost_usd=max_stage_cost_usd(),
+             meta_sessions_dir=round_dir / "meta_sessions" / "critic",
+         )
+         self.audit.append(
+diff --git a/harnessx/aegis/stages/preprocess.py b/harnessx/aegis/stages/preprocess.py
+index b99db6f..f5926fe 100644
+--- a/harnessx/aegis/stages/preprocess.py
++++ b/harnessx/aegis/stages/preprocess.py
+@@ -18,6 +18,7 @@ from collections import defaultdict
+ from pathlib import Path
+ 
+ from ..agents.digester import build_digester_harness, DigesterInputs
++from ..budget import max_stage_cost_usd
+ from .trace_facts import extract_trace_facts
+ 
+ 
+@@ -214,7 +215,7 @@ async def _run_digester(inputs: DigesterInputs, harness) -> None:
+             f"will be discarded."
+         ),
+         max_steps=200,
+-        max_cost_usd=100.0,
++        max_cost_usd=max_stage_cost_usd(),
+     )
+     await harness.run(task)
+ 
+diff --git a/harnessx/tools/builtin/bash.py b/harnessx/tools/builtin/bash.py
+index 0e94ba5..793e068 100644
+--- a/harnessx/tools/builtin/bash.py
++++ b/harnessx/tools/builtin/bash.py
+@@ -5,6 +5,9 @@ from __future__ import annotations
+ import asyncio
+ import os
+ import re
++import shutil
++import subprocess
++import tempfile
+ from pathlib import Path
+ 
+ from ..base import tool
+@@ -13,7 +16,27 @@ from ..base import tool
+ # an active sandbox executes with cwd = <WORK_ROOT>/<run_id>/, so files the
+ # agent creates (e.g. `cat > verify.py`) stay out of the repo. Override with
+ # the HARNESSX_WORK_DIR env var.
+-_WORK_ROOT = Path(os.environ.get("HARNESSX_WORK_DIR", "/tmp/harnessx-work"))
++#
++# Cross-platform default: a literal "/tmp/..." resolves to "\tmp\..." on Windows
++# (drive-relative), so mkdir fails with WinError 5 and EVERY Bash call dies
++# before the command runs -- which is what silently disabled the tools/processor
++# evolution buckets in the BRIGHT pilot, because the Evolver could not run its
++# mandatory build->verify loop for new code.
++_WORK_ROOT = Path(
++    os.environ.get("HARNESSX_WORK_DIR") or (Path(tempfile.gettempdir()) / "harnessx-work")
++)
++
++
++def _resolve_shell() -> str | None:
++    """Shell used by shell-mode commands.
++
++    subprocess defaults to cmd.exe on Windows, which cannot run the POSIX syntax
++    the AEGIS templates assume (`cat > f`, heredocs, `&&` chains with quoted
++    args). Set HARNESSX_BASH to a real bash (e.g. Git for Windows) or have it on
++    PATH to restore POSIX semantics; otherwise the platform default is used.
++    """
++    return os.environ.get("HARNESSX_BASH") or shutil.which("bash")
++
+ 
+ 
+ def _get_work_dir() -> str:
+@@ -126,22 +149,36 @@ async def bash_tool(command: str, timeout: int = _DEFAULT_TIMEOUT_MS) -> str:
+     # No sandbox — direct local subprocess, confined to a per-run work dir
+     # so the agent's `cat > file` / `python3 script.py` don't pollute the repo.
+     cwd = _get_work_dir()
+-    try:
+-        proc = await asyncio.create_subprocess_shell(
++    shell = _resolve_shell()
++
++    # Run the blocking call in a worker thread instead of using
++    # asyncio.create_subprocess_*. On Windows, asyncio's subprocess transport is
++    # built on NAMED pipes (windows_utils.PipeHandle -> CreateNamedPipe), and some
++    # execution environments forbid named pipes outright -- there the await fails
++    # with a bare WinError 5 (access denied) before the command ever starts, while
++    # a plain subprocess.run() with anonymous pipes succeeds. Using an executor
++    # keeps the tool usable in those environments.
++    def _run() -> tuple[int, str, str]:
++        proc = subprocess.run(
+             command,
++            shell=True,
+             cwd=cwd,
+-            stdout=asyncio.subprocess.PIPE,
+-            stderr=asyncio.subprocess.PIPE,
++            executable=shell,
++            capture_output=True,
++            timeout=timeout_sec,
+         )
+-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
+-    except asyncio.TimeoutError:
+-        try:
+-            proc.kill()
+-        except Exception:
+-            pass
++        return (
++            proc.returncode,
++            proc.stdout.decode("utf-8", errors="replace"),
++            proc.stderr.decode("utf-8", errors="replace"),
++        )
++
++    try:
++        _rc, output, errors = await asyncio.get_running_loop().run_in_executor(None, _run)
++    except subprocess.TimeoutExpired:
+         return f"Error: command timed out after {timeout_sec:.0f}s"
+-    output = stdout.decode("utf-8", errors="replace")
+-    errors = stderr.decode("utf-8", errors="replace")
++    except OSError as exc:
++        return f"Error: could not start command: {exc!r}"
+     if errors:
+         return f"{output}\nSTDERR: {errors}"
+     return output
+-- 
+2.55.0.windows.5
+

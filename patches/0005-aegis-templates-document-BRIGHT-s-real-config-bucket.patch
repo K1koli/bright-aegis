@@ -1,0 +1,54 @@
+From ea10fe45f53b49a78ab1859356db9362c19dba81 Mon Sep 17 00:00:00 2001
+From: BRIGHT evolution experiment <experiment@local>
+Date: Wed, 14 Oct 2026 21:00:34 +0800
+Subject: [PATCH 5/6] aegis/templates: document BRIGHT's real config-bucket
+ knobs
+
+The AEGIS Planner measured H_0 and called it 'a zero-degrees-of-freedom wrapper
+around BM25', correctly noting that k was a tool argument the model chose,
+max_steps was hard-coded in the driver, and nothing editable in an applied YAML
+changed retrieval behaviour. The Evolver then shipped prompt-only candidates.
+
+H_0 now carries bright_harness.processors.RetrievalPolicyProcessor with five
+instance kwargs (retrieve_k, snippet_chars, max_retrieve_calls, max_steps,
+dedupe_by_document), the driver reads max_steps from the applied config, and the
+Retrieve tool caps the model's requested k with the policy value. Documenting
+them here is what makes the config bucket discoverable to the Evolver.
+---
+ harnessx/aegis/templates/evolver.md | 19 +++++++++++++------
+ 1 file changed, 13 insertions(+), 6 deletions(-)
+
+diff --git a/harnessx/aegis/templates/evolver.md b/harnessx/aegis/templates/evolver.md
+index 963170a..ec447b6 100644
+--- a/harnessx/aegis/templates/evolver.md
++++ b/harnessx/aegis/templates/evolver.md
+@@ -432,13 +432,20 @@ tool_registry:
+   - bright_harness.tools.Retrieve
+   - file://<scratch>/<name>.py::<symbol>
+ 
+-# bucket = config — H_0's processor stack is only the system prompt + user
+-# wrapper, so there is almost nothing to retune yet. Adding a control processor
+-# (budget guard, retry, output-format guard) is the natural config/processor
+-# candidate, and is where a small task agent usually needs mechanical help.
++# bucket = config — the retrieval policy is a REAL config surface. These five
++# kwargs live on bright_harness.processors.RetrievalPolicyProcessor in
++# R{n}/config.yaml; changing them needs no new code and is validated by the
++# canonicalize gate. The driver reads max_steps from here, so it changes how the
++# next round actually runs.
+ processors:
+-- _target_: harnessx.processors.control.token_budget.TokenBudgetProcessor
+-  ratio: 0.9
++- _target_: bright_harness.processors.RetrievalPolicyProcessor
++  retrieve_k: 10            # passages per Retrieve call, 1..100. The tool CAPS the
++                            # model's requested k with this, so raising it is how you
++                            # attack "gold exists but is outside the returned ten".
++  snippet_chars: 600        # how much of each passage the agent sees
++  max_retrieve_calls: 1     # retrieval budget per query, enforced by the tool
++  max_steps: 4              # harness steps per query (driver reads this)
++  dedupe_by_document: false # keep only the best chunk per source document
+ 
+ # bucket = processor — new processor class
+ processors:
+-- 
+2.55.0.windows.5
+

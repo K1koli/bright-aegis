@@ -1,0 +1,17 @@
+# Normalise text to LF in the repository, but be explicit about the files where the
+# exact bytes matter.
+* text=auto
+
+# Patch files are applied verbatim with `git apply`; CRLF would break the hunks.
+*.patch text eol=lf
+*.diff  text eol=lf
+
+# PBS scripts are submitted to a Linux scheduler — CRLF makes `qsub` fail with
+# "bad interpreter". Shell helpers likewise.
+*.pbs text eol=lf
+*.sh  text eol=lf
+
+# Windows-side helpers really do want CRLF.
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+*.ps1  text eol=crlf

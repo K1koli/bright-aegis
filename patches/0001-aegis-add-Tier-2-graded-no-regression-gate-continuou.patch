@@ -1,0 +1,277 @@
+From b998d252b29d396b67a334806ea87a2d2082e8a0 Mon Sep 17 00:00:00 2001
+From: BRIGHT evolution experiment <experiment@local>
+Date: Wed, 14 Oct 2026 15:24:49 +0800
+Subject: [PATCH 1/6] aegis: add Tier-2 graded no-regression gate (continuous
+ fitness)
+
+Stock AEGIS gates reason only over binary per-task flags, and the only in-gate
+regression check (counterfactual) compares final_output/exit_reason by exact
+string equality on previously-passing tasks. On a graded metric a query can fall
+from 0.62 to 0.21 while still passing a threshold, and the aggregate can rise at
+the same time.
+
+Adds gates/fitness.py: a frozen probe set is re-evaluated per candidate, requiring
+  mean_fitness(candidate) >= mean_fitness(incumbent) + margin
+  fitness_q(candidate)  >= fitness_q(incumbent) - delta   for every probe query
+Context is threaded via AegisAgent(fitness_context=...) -> AegisOrchestrator ->
+set_fitness_context(), mirroring set_counterfactual_context(). The gate runs LAST
+(behind the cheap structural gates and the replay smoke test) because it is the
+only gate that re-executes the harness, and it self-skips when no context is
+wired, so GAIA/tau2/tb2 keep stock behaviour.
+---
+ harnessx/aegis/__init__.py      |   8 ++
+ harnessx/aegis/gates/fitness.py | 138 ++++++++++++++++++++++++++++++++
+ harnessx/aegis/orchestrator.py  |  13 +++
+ harnessx/aegis/stages/commit.py |  14 ++++
+ 4 files changed, 173 insertions(+)
+ create mode 100644 harnessx/aegis/gates/fitness.py
+
+diff --git a/harnessx/aegis/__init__.py b/harnessx/aegis/__init__.py
+index 68b2e9d..f3abe42 100644
+--- a/harnessx/aegis/__init__.py
++++ b/harnessx/aegis/__init__.py
+@@ -49,6 +49,13 @@ class AegisAgent:
+     # but wired for forward-compat.
+     auto_revert_enabled: bool = True
+     benchmark_context: str = ""
++    # Graded-fitness context for the Stage-4 no-regression gate (Tier-2
++    # adaptation for continuously-scored benchmarks). Expected shape:
++    # ``{probe_qids: list[str], incumbent_scores: dict[str, float],
++    #    fitness_fn: Callable[[Path, list[str]], dict[str, float]],
++    #    delta: float, margin: float}``. None (default) preserves the stock
++    # binary behaviour: the gate self-skips.
++    fitness_context: dict | None = None
+ 
+     async def evolve(
+         self,
+@@ -112,6 +119,7 @@ class AegisAgent:
+             replay_model=self.replay_model,
+             auto_revert_enabled=self.auto_revert_enabled,
+             benchmark_context=self.benchmark_context,
++            fitness_context=self.fitness_context,
+         )
+ 
+         run_round_result = await orch.run_round(
+diff --git a/harnessx/aegis/gates/fitness.py b/harnessx/aegis/gates/fitness.py
+new file mode 100644
+index 0000000..cc38d88
+--- /dev/null
++++ b/harnessx/aegis/gates/fitness.py
+@@ -0,0 +1,138 @@
++# Copyright 2026 Darwin-Agent
++# SPDX-License-Identifier: MIT
++"""Graded no-regression gate — Tier-2 adaptation for continuous fitness.
++
++The stock AEGIS gates reason over **binary** per-task flags. The only in-gate
++regression check, :mod:`harnessx.aegis.gates.counterfactual`, protects
++previously-passing tasks by exact string equality of ``final_output`` /
++``exit_reason``, which cannot see a task sliding from 0.62 to 0.21 while still
++"passing" a threshold. For benchmarks scored with a graded metric (BRIGHT's
++nDCG@10) that blind spot is the difference between a harness that generalises
++and one that trades one query for another.
++
++This gate re-evaluates the candidate harness on a **frozen probe set** and
++requires both:
++
++    mean_fitness(candidate) >= mean_fitness(incumbent) + margin      (aggregate)
++    fitness_q(candidate)    >= fitness_q(incumbent)   - delta    for every q
++
++``margin`` and ``delta`` are registered a priori and never adjusted per round;
++the probe set is fixed for the whole run so scores stay comparable across
++rounds. Both are read from the fitness context, which the recipe drives via
++``AegisAgent(fitness_context=...)``.
++
++Cost: one harness evaluation per probe query per candidate that reaches this
++gate. It is therefore placed **last** in the gate order, behind the cheap
++structural gates and the replay smoke test, so a candidate that cannot ship for
++a structural reason never pays for it.
++"""
++from __future__ import annotations
++
++import inspect
++from pathlib import Path
++from typing import Any
++
++from .structure import GateResult
++
++__all__ = ["set_fitness_context", "get_fitness_context", "check_fitness_noregress"]
++
++# Module-level context, mirroring ``set_counterfactual_context`` in
++# ``harnessx.aegis.stages.commit``. Orchestrator populates it before calling
++# run_stage_4. Keys:
++#   probe_qids       : list[str]           frozen probe query ids
++#   incumbent_scores : dict[str, float]    incumbent harness's per-query fitness
++#   fitness_fn       : Callable[[Path, list[str]], Awaitable|dict]
++#                                          evaluates a candidate config YAML
++#   delta            : float               per-query regression tolerance
++#   margin           : float               aggregate improvement requirement
++# None → gate short-circuits ok (so benchmarks without graded fitness keep the
++# stock behaviour).
++_FITNESS_CONTEXT: dict | None = None
++
++
++def set_fitness_context(ctx: dict | None) -> None:
++    global _FITNESS_CONTEXT
++    _FITNESS_CONTEXT = ctx
++
++
++def get_fitness_context() -> dict | None:
++    return _FITNESS_CONTEXT
++
++
++async def _maybe_await(value: Any) -> Any:
++    if inspect.isawaitable(value):
++        return await value
++    return value
++
++
++def _mean(values: list[float]) -> float:
++    return sum(values) / len(values) if values else 0.0
++
++
++async def check_fitness_noregress(
++    candidate_config_path: str | Path,
++    *,
++    context: dict | None = None,
++) -> GateResult:
++    ctx = context if context is not None else _FITNESS_CONTEXT
++    if ctx is None:
++        return GateResult(True, "skipped: no fitness context wired")
++
++    qids = [str(q) for q in (ctx.get("probe_qids") or [])]
++    incumbent = {str(k): float(v) for k, v in (ctx.get("incumbent_scores") or {}).items()}
++    fitness_fn = ctx.get("fitness_fn")
++    if not qids:
++        return GateResult(True, "skipped: no probe queries wired")
++    if fitness_fn is None:
++        return GateResult(True, "skipped: no fitness_fn wired")
++    if not incumbent:
++        return GateResult(True, "skipped: incumbent scores unavailable")
++
++    delta = float(ctx.get("delta", 0.05))
++    margin = float(ctx.get("margin", 0.0))
++
++    try:
++        scores = await _maybe_await(fitness_fn(Path(candidate_config_path), qids))
++    except Exception as exc:  # noqa: BLE001
++        return GateResult(False, f"fitness: candidate evaluation failed: {exc!r}")
++    if not isinstance(scores, dict):
++        return GateResult(False, f"fitness: fitness_fn returned {type(scores).__name__}, expected dict")
++
++    missing = [q for q in qids if q not in scores]
++    if missing:
++        return GateResult(
++            False,
++            f"fitness: no score for {len(missing)}/{len(qids)} probe queries "
++            f"(e.g. {missing[0]}) — a candidate that cannot run the probe set cannot ship",
++        )
++
++    cand_scores = {q: float(scores[q]) for q in qids}
++    shared = [q for q in qids if q in incumbent]
++    if not shared:
++        return GateResult(True, "skipped: no probe query has an incumbent score")
++
++    mean_cand = _mean([cand_scores[q] for q in shared])
++    mean_inc = _mean([incumbent[q] for q in shared])
++
++    if mean_cand + 1e-12 < mean_inc + margin:
++        return GateResult(
++            False,
++            f"fitness: aggregate regression — candidate {mean_cand:.4f} < "
++            f"incumbent {mean_inc:.4f} + margin {margin:g} (n={len(shared)})",
++        )
++
++    regressed = [q for q in shared if cand_scores[q] < incumbent[q] - delta]
++    if regressed:
++        worst = min(regressed, key=lambda q: cand_scores[q] - incumbent[q])
++        return GateResult(
++            False,
++            f"fitness: {len(regressed)}/{len(shared)} probe queries regressed beyond "
++            f"delta={delta:g} (worst {worst}: {incumbent[worst]:.4f} -> {cand_scores[worst]:.4f}); "
++            f"aggregate {mean_inc:.4f} -> {mean_cand:.4f}",
++        )
++
++    return GateResult(
++        True,
++        f"fitness ok: {mean_inc:.4f} -> {mean_cand:.4f} "
++        f"(delta={delta:g}, margin={margin:g}, n={len(shared)})",
++    )
+diff --git a/harnessx/aegis/orchestrator.py b/harnessx/aegis/orchestrator.py
+index 745a3f9..c4447f2 100644
+--- a/harnessx/aegis/orchestrator.py
++++ b/harnessx/aegis/orchestrator.py
+@@ -127,6 +127,12 @@ class AegisOrchestrator:
+     min_actionability: float = 0.3
+     # Benchmark context string forwarded to the evolver template.
+     benchmark_context: str = ""
++    # Graded-fitness context for the Stage-4 fitness gate (see
++    # ``gates/fitness.py``). Recipes whose benchmark is scored with a continuous
++    # metric (e.g. BRIGHT's nDCG@10) pass
++    # ``{probe_qids, incumbent_scores, fitness_fn, delta, margin}``; None keeps
++    # the stock binary behaviour and the gate self-skips.
++    fitness_context: dict | None = None
+     # TODO(stage5): ``adjudicate_previous_round`` is not called from ``run_round``.
+     # Stage 5 runs ACROSS rounds in the pilot driver (not inside this class).
+     # When the pilot loop is implemented, it should call
+@@ -529,6 +535,13 @@ class AegisOrchestrator:
+                 "k_samples": 3,
+             }
+         )
++        # Tier-2: wire the graded-fitness gate's context. Refreshed every round
++        # so ``incumbent_scores`` always describes the harness that is actually
++        # current — a stale incumbent would let a candidate be judged against a
++        # harness it no longer replaces.
++        from .gates.fitness import set_fitness_context
++
++        set_fitness_context(self.fitness_context)
+         # v0.9.3 IV-11: extract strategy_concern_flagged_buckets from the
+         # current round's landscape.md frontmatter (Planner relays it from
+         # the previous round's Critic decision). Gate is a no-op if the
+diff --git a/harnessx/aegis/stages/commit.py b/harnessx/aegis/stages/commit.py
+index c8eba02..a7c2177 100644
+--- a/harnessx/aegis/stages/commit.py
++++ b/harnessx/aegis/stages/commit.py
+@@ -17,6 +17,7 @@ from harnessx.aegis.gates.novelty import check_novelty
+ from harnessx.aegis.gates.canonicalize import check_canonicalize
+ from harnessx.aegis.gates.replay import check_replay_smoke
+ from harnessx.aegis.gates.counterfactual import check_counterfactual_replay
++from harnessx.aegis.gates.fitness import check_fitness_noregress
+ from harnessx.aegis.agents.evolver import parse_candidate_manifest
+ 
+ 
+@@ -93,6 +94,7 @@ async def _run_all_gates(
+             "structure": structure, "novelty": novelty,
+             "canonicalize": GateVerdict(False, _SKIP),
+             "replay": GateVerdict(False, _SKIP),
++            "fitness": GateVerdict(False, _SKIP),
+         }
+ 
+     # E1: load + canonicalize the applied YAML ONCE up front and reuse the
+@@ -151,12 +153,24 @@ async def _run_all_gates(
+                 rr = await check_replay_smoke(cfg_loaded, model_config=replay_model)
+                 replay = GateVerdict(rr.ok, rr.reason)
+ 
++    # Graded fitness gate (Tier-2 adaptation for continuous metrics). Runs LAST:
++    # it is the only gate that re-executes the harness over the probe set, so a
++    # candidate that already failed a cheap gate must never pay for it. Short-
++    # circuits ok when the recipe wired no fitness context, which is what keeps
++    # the stock binary benchmarks (GAIA/tau2/tb2) behaving exactly as before.
++    if canonical.ok and counterfactual.ok and replay.ok:
++        fv = await check_fitness_noregress(candidate_config_path)
++        fitness = GateVerdict(fv.ok, fv.reason)
++    else:
++        fitness = GateVerdict(False, _SKIP)
++
+     return {
+         "structure": structure,
+         "novelty": novelty,
+         "canonicalize": canonical,
+         "counterfactual": counterfactual,
+         "replay": replay,
++        "fitness": fitness,
+     }
+ 
+ 
+-- 
+2.55.0.windows.5
+

@@ -1,0 +1,118 @@
+From 92e4a3eab30555966e2034d81d3f2e5c1c7e482e Mon Sep 17 00:00:00 2001
+From: BRIGHT evolution experiment <experiment@local>
+Date: Wed, 14 Oct 2026 15:27:14 +0800
+Subject: [PATCH 2/6] aegis: add a BRIGHT benchmark_context branch to the
+ Evolver template
+
+The generic branch shows 'builtin: [WebSearch, WebFetch, Browser, Read, Bash]',
+which is actively misleading for BRIGHT: H_0 has no builtin tools and the only
+corpus access primitive is the custom tool bright_harness.tools.Retrieve, which
+reads its corpus from a ContextVar the driver binds.
+
+The new branch states the four things an Evolver must not get wrong: how to reach
+the active index, that the final message must stay a parseable JSON id array,
+that qrels/eval data are out of reach (reward hacking), and that changes must
+generalise to the unseen economics/robotics corpora.
+---
+ harnessx/aegis/templates/evolver.md | 78 +++++++++++++++++++++++++++++
+ 1 file changed, 78 insertions(+)
+
+diff --git a/harnessx/aegis/templates/evolver.md b/harnessx/aegis/templates/evolver.md
+index a6e2df4..963170a 100644
+--- a/harnessx/aegis/templates/evolver.md
++++ b/harnessx/aegis/templates/evolver.md
+@@ -311,6 +311,37 @@ check `get_data_usage` to determine if the data cap has been exceeded."
+ Bad example: rewriting the entire troubleshooting flow or adding broad
+ "Server-side checks FIRST" guidance that conflicts with the policy's
+ prescribed order.
++{% elif benchmark_context == "bright" %}
++**CRITICAL — BRIGHT benchmark constraints.** This is a *reasoning-intensive
++retrieval* harness: it is scored by nDCG@10 over the ten document ids its final
++message returns. There is no environment to explore and no answer to phrase.
++The only thing that moves the score is **which document ids end up in that list
++and in what order**.
++
++1. `Retrieve` is the only corpus access primitive, registered as the custom tool
++   `bright_harness.tools.Retrieve`. It reads the domain corpus from a ContextVar
++   the driver binds around the run. A NEW tool or processor you ship must obtain
++   the corpus the same way:
++   `from bright_harness.tools import get_active_index` — the returned object has
++   `.search(query, k) -> list[(doc_id, score)]` and `.text_of(doc_id) -> str`.
++   Never open the corpus or any data file yourself.
++2. The final message MUST stay a JSON array of document ids, best first. A
++   processor that rewrites final output must preserve that contract: an
++   unparseable answer scores exactly 0, so "tidying up" the output can destroy
++   a working harness.
++3. **Never touch evaluation data.** `gold_ids`, qrels, `excluded_ids` and the
++   `data/bright/` tree live outside the harness. A candidate that reads them, or
++   that hard-codes document ids, ground-truth answers or dataset statistics, is
++   reward hacking and will be rejected.
++4. Prefer changes that generalise. The same harness is later evaluated, exactly
++   as shipped, on economics and robotics corpora whose documents and vocabulary
++   it has never seen. Long domain-specific term lists, hand-written synonym
++   tables and per-query special cases are a red flag: they buy biology and lose
++   everything else.
++5. The retrieval bottleneck is *reasoning*, not matching: BRIGHT queries are
++   phrased as claims or quotations while the relevant passage often uses
++   different wording. Query understanding, decomposition, reformulation,
++   multi-query fusion and reranking are the productive directions.
+ {% endif %}
+ 
+ Final_output text alone ships nothing.
+@@ -382,6 +413,53 @@ class AppendSystemPromptProcessor(MultiHookProcessor):
+                     thinking_blocks=orig.thinking_blocks, msg_id=orig.msg_id)
+         yield event
+ ```
++{% elif benchmark_context == "bright" %}
++```yaml
++# bucket = prompt — the baseline prompt is src/bright_harness/prompts/h0_system.md.
++# `template_path` MUST point inside your own applied/<cid>/ scratch dir.
++processors:
++- _target_: harnessx.processors.context.system_prompt.SystemPromptProcessor
++  system_builder:
++    _target_: harnessx.processors.context.strategies.system_prompt.plain_markdown.PlainMarkdownSystemPromptBuilder
++    template_path: <scratch>/<name>.md
++
++# bucket = tools — H_0 has NO builtin tools, so `builtin` stays [].
++# Keep Retrieve and add your own primitive beside it. `custom` entries accept
++# either an importable "module.attr" path (@tool object) or a file:// URI.
++tool_registry:
++  builtin: []
++  custom:
++  - bright_harness.tools.Retrieve
++  - file://<scratch>/<name>.py::<symbol>
++
++# bucket = config — H_0's processor stack is only the system prompt + user
++# wrapper, so there is almost nothing to retune yet. Adding a control processor
++# (budget guard, retry, output-format guard) is the natural config/processor
++# candidate, and is where a small task agent usually needs mechanical help.
++processors:
++- _target_: harnessx.processors.control.token_budget.TokenBudgetProcessor
++  ratio: 0.9
++
++# bucket = processor — new processor class
++processors:
++- _target_: file://<scratch>/<name>.py::YourProcessor
++  some_kwarg: 30
++  _hook_: '*'
++```
++
++A tool you ship must be usable by the harness's active index, e.g.:
++
++```python
++from __future__ import annotations
++from harnessx.tools.base import tool
++from bright_harness.tools import get_active_index
++
++@tool(name="RerankByReasoning", description="Reorder candidate passages by how well they answer the request.")
++async def rerank(query: str, doc_ids: str, top_k: int = 10) -> str:
++    index = get_active_index()
++    ...  # may call the model itself? NO — tools are not model calls.
++    return "\\n".join(ranked_ids)
++```
+ {% else %}
+ ```yaml
+ # bucket = prompt
+-- 
+2.55.0.windows.5
+

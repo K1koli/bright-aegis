@@ -1,0 +1,8 @@
+{
+  "model": "Qwen3.5-9B",
+  "messages": [
+    {"role": "user", "content": "Reply with exactly: OK"}
+  ],
+  "max_tokens": 32,
+  "temperature": 0
+}

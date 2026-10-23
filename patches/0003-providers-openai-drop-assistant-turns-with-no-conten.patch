@@ -1,0 +1,81 @@
+From a5a118718c67c210693e6e8ad6da2d83abfc8288 Mon Sep 17 00:00:00 2001
+From: BRIGHT evolution experiment <experiment@local>
+Date: Wed, 14 Oct 2026 20:07:21 +0800
+Subject: [PATCH 3/6] providers/openai: drop assistant turns with no content
+ and no tool_calls
+
+DeepSeek-V4-Flash rejects such a message outright:
+  400 Invalid assistant message: content or tool_calls must be set
+
+HarnessX produces one whenever a model step yields only reasoning and neither
+text nor a tool call, then replays it in the next request. Observed driving the
+AEGIS Evolver stage: the loop died at step 25 after 1.87M tokens (~\.9) with 0
+candidates, twice in one round.
+
+The turn carries nothing the next request needs, so dropping it is safe; the
+matching orphaned tool result is removed by _fix_tool_call_pairing, which runs
+immediately after. vLLM (lenient) is unaffected either way.
+
+Also note: AegisAgent.budget_per_round_usd is declared and threaded through
+cli.py/orchestrator.py/__init__.py but never read, so it enforces nothing --
+cost control has to come from shrinking the round's inputs.
+---
+ harnessx/providers/openai_provider.py | 35 +++++++++++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+
+diff --git a/harnessx/providers/openai_provider.py b/harnessx/providers/openai_provider.py
+index 70c8f35..c084cbd 100644
+--- a/harnessx/providers/openai_provider.py
++++ b/harnessx/providers/openai_provider.py
+@@ -35,6 +35,40 @@ def _is_anthropic_model(model: str) -> bool:
+     return any(model.lower().startswith(p) for p in _ANTHROPIC_MODEL_PREFIXES)
+ 
+ 
++def _has_no_payload(msg: dict) -> bool:
++    """True for an assistant turn carrying neither text nor tool calls."""
++    if msg.get("role") != "assistant" or msg.get("tool_calls"):
++        return False
++    content = msg.get("content")
++    if content is None:
++        return True
++    if isinstance(content, str):
++        return not content.strip()
++    if isinstance(content, (list, tuple)):
++        return len(content) == 0
++    return False
++
++
++def _drop_empty_assistant_messages(messages: list[dict]) -> list[dict]:
++    """Remove assistant turns that have neither content nor tool_calls.
++
++    Strict providers reject them outright. DeepSeek-V4-Flash returns
++    400 "Invalid assistant message: content or tool_calls must be set", which
++    killed the AEGIS Evolver loop after 1.87M tokens (~$5.9) with 0 candidates.
++    The turn arises when a model step yields only reasoning and neither text nor
++    a tool call, so it carries nothing the next request needs. Dropping it is
++    safe for lenient providers (vLLM) too. Orphaned tool results left behind are
++    cleaned up by :func:`_fix_tool_call_pairing`, which runs immediately after.
++    """
++    kept: list[dict] = []
++    for m in messages:
++        if _has_no_payload(m):
++            logger.warning("dropping empty assistant message (no content, no tool_calls) before send")
++            continue
++        kept.append(m)
++    return kept
++
++
+ def _fix_tool_call_pairing(messages: list[dict]) -> list[dict]:
+     """Ensure tool_call/tool_result pairing is valid for the OpenAI API.
+ 
+@@ -249,6 +283,7 @@ class OpenAIProvider(BaseModelProvider):
+                 ]
+             oai_messages.append(msg)
+ 
++        oai_messages = _drop_empty_assistant_messages(oai_messages)
+         oai_messages = _fix_tool_call_pairing(oai_messages)
+ 
+         oai_tools = to_openai_tools(tools)
+-- 
+2.55.0.windows.5
+

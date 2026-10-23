@@ -1,0 +1,91 @@
+From 34f8d916e4954a6c85af94ddbf722a931148ae3d Mon Sep 17 00:00:00 2001
+From: BRIGHT evolution experiment <experiment@local>
+Date: Thu, 15 Oct 2026 16:39:14 +0800
+Subject: [PATCH 6/6] aegis: stop the Digester/Evolver from misreading
+ externalised tool payloads as empty
+
+Root cause of a \ / 200-step / zero-candidate Evolver round: the journal
+externalises tool results >2048 chars into tool_results/<id>_raw.txt and leaves
+message.content empty. extract_trace_facts read the empty string, classified the
+return as return_type=empty/return_len=0, and the Digester then reported
+'empty tool return' as a failure mode. The Evolver believed it, and spent its
+entire budget re-deriving the evidence from raw files and the corpus (it
+downloaded pyarrow to read the parquet and wrote ~30 exploratory scripts),
+never reaching the manifest.
+
+trace_facts now reads meta.content_size and, when the in-band content is empty
+but the externalised size is non-zero, reports return_type=externalized with the
+real length. Also hardens the BRIGHT Evolver branch with an explicit deliverable
+contract: ONE candidate = manifest FIRST then applied config, no exploratory
+scripts, no pip installs, no reading data/ or tool_results/ to 'verify'.
+---
+ harnessx/aegis/stages/trace_facts.py | 26 ++++++++++++++++++++------
+ harnessx/aegis/templates/evolver.md  | 13 +++++++++++++
+ 2 files changed, 33 insertions(+), 6 deletions(-)
+
+diff --git a/harnessx/aegis/stages/trace_facts.py b/harnessx/aegis/stages/trace_facts.py
+index 1c50848..c6c6479 100644
+--- a/harnessx/aegis/stages/trace_facts.py
++++ b/harnessx/aegis/stages/trace_facts.py
+@@ -353,14 +353,28 @@ def extract_trace_facts(
+                 else:
+                     rmsg = result_ev.get("message") or {}
+                     rtext, structured = _content_to_text(rmsg.get("content"))
+-                    return_type = _classify_return(rtext, structured)
+-                    return_len = len(rtext)
+-                    if not next_asst_text:
++                    meta = result_ev.get("meta") or {}
++                    ext_size = meta.get("content_size") or meta.get("size")
++                    if not rtext.strip() and ext_size:
++                        # The journal externalised a large tool payload into
++                        # tool_results/<id>_raw.txt and left message.content empty.
++                        # That is NOT an empty return: the model DID receive
++                        # ext_size bytes. Without this, the Digester concludes
++                        # "empty tool return" and the Evolver then re-derives the
++                        # evidence from raw files -- measured in the BRIGHT pilot as
++                        # 200 steps, $41, pyarrow downloaded, zero candidates.
++                        return_type = "externalized"
++                        return_len = int(ext_size)
+                         next_uses = None
+-                    elif return_len < 20:
+-                        next_uses = None  # too short to tell
+                     else:
+-                        next_uses = _shares_substring(rtext, next_asst_text, min_len=20)
++                        return_type = _classify_return(rtext, structured)
++                        return_len = len(rtext)
++                        if not next_asst_text:
++                            next_uses = None
++                        elif return_len < 20:
++                            next_uses = None  # too short to tell
++                        else:
++                            next_uses = _shares_substring(rtext, next_asst_text, min_len=20)
+                 per_rollout_calls.append(
+                     ToolCallFact(
+                         rollout=rollout,
+diff --git a/harnessx/aegis/templates/evolver.md b/harnessx/aegis/templates/evolver.md
+index ec447b6..2b87807 100644
+--- a/harnessx/aegis/templates/evolver.md
++++ b/harnessx/aegis/templates/evolver.md
+@@ -342,6 +342,19 @@ and in what order**.
+    phrased as claims or quotations while the relevant passage often uses
+    different wording. Query understanding, decomposition, reformulation,
+    multi-query fusion and reranking are the productive directions.
++6. **Deliverable contract — do not rabbit-hole.** Your entire job is to ship
++   exactly ONE candidate, which is exactly TWO files, written **in this order**,
++   then stop:
++   1. the manifest: `<candidates_dir>/C-R{{ round }}-NN.md` — this is what the gate reads;
++   2. the applied config plus any new asset files under
++      `<applied_root>/C-R{{ round }}-NN/`.
++   A round where the applied files exist but the manifest does not ships NOTHING.
++   Do NOT write exploratory scripts, do NOT `pip install` packages, and do NOT
++   read `data/bright/` or the session `tool_results/*.txt` to "verify" the
++   evidence — the digests and trajectories you were handed ARE the evidence. The
++   only verification ever warranted is a single one-liner to confirm any new code
++   imports. If you run out of steps before writing the manifest, the round is
++   wasted and the budget is gone.
+ {% endif %}
+ 
+ Final_output text alone ships nothing.
+-- 
+2.55.0.windows.5
+

@@ -1,0 +1,777 @@
+diff --git a/harnessx/aegis/__init__.py b/harnessx/aegis/__init__.py
+index 68b2e9d..f3abe42 100644
+--- a/harnessx/aegis/__init__.py
++++ b/harnessx/aegis/__init__.py
+@@ -49,6 +49,13 @@ class AegisAgent:
+     # but wired for forward-compat.
+     auto_revert_enabled: bool = True
+     benchmark_context: str = ""
++    # Graded-fitness context for the Stage-4 no-regression gate (Tier-2
++    # adaptation for continuously-scored benchmarks). Expected shape:
++    # ``{probe_qids: list[str], incumbent_scores: dict[str, float],
++    #    fitness_fn: Callable[[Path, list[str]], dict[str, float]],
++    #    delta: float, margin: float}``. None (default) preserves the stock
++    # binary behaviour: the gate self-skips.
++    fitness_context: dict | None = None
+ 
+     async def evolve(
+         self,
+@@ -112,6 +119,7 @@ class AegisAgent:
+             replay_model=self.replay_model,
+             auto_revert_enabled=self.auto_revert_enabled,
+             benchmark_context=self.benchmark_context,
++            fitness_context=self.fitness_context,
+         )
+ 
+         run_round_result = await orch.run_round(
+diff --git a/harnessx/aegis/budget.py b/harnessx/aegis/budget.py
+new file mode 100644
+index 0000000..698f428
+--- /dev/null
++++ b/harnessx/aegis/budget.py
+@@ -0,0 +1,37 @@
++# Copyright 2026 Darwin-Agent
++# SPDX-License-Identifier: MIT
++"""Per-stage cost ceilings for the AEGIS meta-agents.
++
++Every meta stage (Digester / Planner / Evolver / Critic) runs with a
++``CostGuardProcessor`` whose ceiling was hard-coded to $100 in the orchestrator
++and in Stage P. That is a reasonable default for a frontier-model pilot, but it
++puts no effective brake on a stage that decides to iterate: in the BRIGHT pilot
++the Evolver alone ran 63 steps and spent $16.32, and the round totalled ~$27.5.
++
++This module makes the ceiling one env-var-controlled value so a driver can bound
++a whole run without patching the engine:
++
++    AEGIS_MAX_STAGE_COST_USD=6.0
++
++Note ``AegisAgent.budget_per_round_usd`` is NOT this knob: it is accepted and
++threaded through the public API but never read, so it enforces nothing. This is
++the ceiling the CostGuardProcessor actually enforces.
++"""
++from __future__ import annotations
++
++import os
++
++DEFAULT_STAGE_COST_USD = 100.0
++
++ENV_VAR = "AEGIS_MAX_STAGE_COST_USD"
++
++
++def max_stage_cost_usd() -> float:
++    """Cost ceiling for a single meta stage, from ``AEGIS_MAX_STAGE_COST_USD``."""
++    raw = os.environ.get(ENV_VAR)
++    if raw is None or not str(raw).strip():
++        return DEFAULT_STAGE_COST_USD
++    try:
++        return float(raw)
++    except (TypeError, ValueError):
++        return DEFAULT_STAGE_COST_USD
+diff --git a/harnessx/aegis/gates/fitness.py b/harnessx/aegis/gates/fitness.py
+new file mode 100644
+index 0000000..cc38d88
+--- /dev/null
++++ b/harnessx/aegis/gates/fitness.py
+@@ -0,0 +1,138 @@
++# Copyright 2026 Darwin-Agent
++# SPDX-License-Identifier: MIT
++"""Graded no-regression gate — Tier-2 adaptation for continuous fitness.
++
++The stock AEGIS gates reason over **binary** per-task flags. The only in-gate
++regression check, :mod:`harnessx.aegis.gates.counterfactual`, protects
++previously-passing tasks by exact string equality of ``final_output`` /
++``exit_reason``, which cannot see a task sliding from 0.62 to 0.21 while still
++"passing" a threshold. For benchmarks scored with a graded metric (BRIGHT's
++nDCG@10) that blind spot is the difference between a harness that generalises
++and one that trades one query for another.
++
++This gate re-evaluates the candidate harness on a **frozen probe set** and
++requires both:
++
++    mean_fitness(candidate) >= mean_fitness(incumbent) + margin      (aggregate)
++    fitness_q(candidate)    >= fitness_q(incumbent)   - delta    for every q
++
++``margin`` and ``delta`` are registered a priori and never adjusted per round;
++the probe set is fixed for the whole run so scores stay comparable across
++rounds. Both are read from the fitness context, which the recipe drives via
++``AegisAgent(fitness_context=...)``.
++
++Cost: one harness evaluation per probe query per candidate that reaches this
++gate. It is therefore placed **last** in the gate order, behind the cheap
++structural gates and the replay smoke test, so a candidate that cannot ship for
++a structural reason never pays for it.
++"""
++from __future__ import annotations
++
++import inspect
++from pathlib import Path
++from typing import Any
++
++from .structure import GateResult
++
++__all__ = ["set_fitness_context", "get_fitness_context", "check_fitness_noregress"]
++
++# Module-level context, mirroring ``set_counterfactual_context`` in
++# ``harnessx.aegis.stages.commit``. Orchestrator populates it before calling
++# run_stage_4. Keys:
++#   probe_qids       : list[str]           frozen probe query ids
++#   incumbent_scores : dict[str, float]    incumbent harness's per-query fitness
++#   fitness_fn       : Callable[[Path, list[str]], Awaitable|dict]
++#                                          evaluates a candidate config YAML
++#   delta            : float               per-query regression tolerance
++#   margin           : float               aggregate improvement requirement
++# None → gate short-circuits ok (so benchmarks without graded fitness keep the
++# stock behaviour).
++_FITNESS_CONTEXT: dict | None = None
++
++
++def set_fitness_context(ctx: dict | None) -> None:
++    global _FITNESS_CONTEXT
++    _FITNESS_CONTEXT = ctx
++
++
++def get_fitness_context() -> dict | None:
++    return _FITNESS_CONTEXT
++
++
++async def _maybe_await(value: Any) -> Any:
++    if inspect.isawaitable(value):
++        return await value
++    return value
++
++
++def _mean(values: list[float]) -> float:
++    return sum(values) / len(values) if values else 0.0
++
++
++async def check_fitness_noregress(
++    candidate_config_path: str | Path,
++    *,
++    context: dict | None = None,
++) -> GateResult:
++    ctx = context if context is not None else _FITNESS_CONTEXT
++    if ctx is None:
++        return GateResult(True, "skipped: no fitness context wired")
++
++    qids = [str(q) for q in (ctx.get("probe_qids") or [])]
++    incumbent = {str(k): float(v) for k, v in (ctx.get("incumbent_scores") or {}).items()}
++    fitness_fn = ctx.get("fitness_fn")
++    if not qids:
++        return GateResult(True, "skipped: no probe queries wired")
++    if fitness_fn is None:
++        return GateResult(True, "skipped: no fitness_fn wired")
++    if not incumbent:
++        return GateResult(True, "skipped: incumbent scores unavailable")
++
++    delta = float(ctx.get("delta", 0.05))
++    margin = float(ctx.get("margin", 0.0))
++
++    try:
++        scores = await _maybe_await(fitness_fn(Path(candidate_config_path), qids))
++    except Exception as exc:  # noqa: BLE001
++        return GateResult(False, f"fitness: candidate evaluation failed: {exc!r}")
++    if not isinstance(scores, dict):
++        return GateResult(False, f"fitness: fitness_fn returned {type(scores).__name__}, expected dict")
++
++    missing = [q for q in qids if q not in scores]
++    if missing:
++        return GateResult(
++            False,
++            f"fitness: no score for {len(missing)}/{len(qids)} probe queries "
++            f"(e.g. {missing[0]}) — a candidate that cannot run the probe set cannot ship",
++        )
++
++    cand_scores = {q: float(scores[q]) for q in qids}
++    shared = [q for q in qids if q in incumbent]
++    if not shared:
++        return GateResult(True, "skipped: no probe query has an incumbent score")
++
++    mean_cand = _mean([cand_scores[q] for q in shared])
++    mean_inc = _mean([incumbent[q] for q in shared])
++
++    if mean_cand + 1e-12 < mean_inc + margin:
++        return GateResult(
++            False,
++            f"fitness: aggregate regression — candidate {mean_cand:.4f} < "
++            f"incumbent {mean_inc:.4f} + margin {margin:g} (n={len(shared)})",
++        )
++
++    regressed = [q for q in shared if cand_scores[q] < incumbent[q] - delta]
++    if regressed:
++        worst = min(regressed, key=lambda q: cand_scores[q] - incumbent[q])
++        return GateResult(
++            False,
++            f"fitness: {len(regressed)}/{len(shared)} probe queries regressed beyond "
++            f"delta={delta:g} (worst {worst}: {incumbent[worst]:.4f} -> {cand_scores[worst]:.4f}); "
++            f"aggregate {mean_inc:.4f} -> {mean_cand:.4f}",
++        )
++
++    return GateResult(
++        True,
++        f"fitness ok: {mean_inc:.4f} -> {mean_cand:.4f} "
++        f"(delta={delta:g}, margin={margin:g}, n={len(shared)})",
++    )
+diff --git a/harnessx/aegis/gates/structure.py b/harnessx/aegis/gates/structure.py
+index 1a3b295..33a14f8 100644
+--- a/harnessx/aegis/gates/structure.py
++++ b/harnessx/aegis/gates/structure.py
+@@ -137,6 +137,41 @@ def _normalize_bucket(bucket) -> list[str]:
+     return []
+ 
+ 
++# Scratch-code naming the Evolver actually uses, in both of its observed conventions:
++#   _verify.py / _price3.py / _probe_r2.py / _canon.py   (leading underscore)
++#   verify_c_r8_01.py / check_r4.py / probe_env.py        (verb prefix)
++# Only .py is eligible: a `_`-prefixed .md is NOT scratch (a config-bucket candidate
++# could smuggle a prompt template that way, which is exactly what IV-9 stops).
++_SCRATCH_PY_RE = re.compile(
++    r"^(?:_.*|(?:verify|check|probe|price|debug|dbg|test|diag)[_A-Za-z0-9]*)$"
++)
++
++
++def _is_scratch(path: str) -> bool:
++    """True for a scratch verification script (``_verify.py``, ``verify_c_r8_01.py``).
++
++    The Evolver writes these beside the asset they verify and never references them
++    from the shipped ``config.yaml``, so they carry no behaviour and cannot be the
++    cross-bucket pollution IV-9 exists to stop. Restricted to ``.py`` on purpose: a
++    ``_``-prefixed ``.md`` could be a real prompt template.
++
++    Ignoring this cost two runs their entire evolution budget:
++
++      - econ R1 C-R1-03 was the ONLY candidate that run's Critic ever selected. It was
++        rejected for listing ``_verify_deep_snippets.py`` under
++        bucket=['config','prompt']; the run then went no-op/no-op and hit patience at
++        round 2 with zero ships, so the domain was never actually measured.
++      - rob R8 C-R8-01 was rejected the same way for ``verify_c_r8_01.py``.
++
++    Both were correct candidates killed by a packaging detail unrelated to whether
++    the harness works.
++    """
++    name = Path(path).name
++    if not name.lower().endswith(".py"):
++        return False
++    return bool(_SCRATCH_PY_RE.match(Path(name).stem))
++
++
+ def _check_bucket_file_consistency(bucket, file_changes: list) -> str | None:
+     """v0.9.2 IV-9 helper: ensure file_changes match the declared bucket.
+ 
+@@ -179,6 +214,9 @@ def _check_bucket_file_consistency(bucket, file_changes: list) -> str | None:
+             continue
+         if path.endswith(("__pycache__",)):
+             continue
++        # Scratch files are evidence, not shipped assets: see _is_scratch.
++        if _is_scratch(path):
++            continue
+         lower = path.lower()
+         if not any(lower.endswith(ext) for ext in ok_ext_set):
+             violations.append(f"{path}")
+diff --git a/harnessx/aegis/orchestrator.py b/harnessx/aegis/orchestrator.py
+index 745a3f9..02168aa 100644
+--- a/harnessx/aegis/orchestrator.py
++++ b/harnessx/aegis/orchestrator.py
+@@ -12,6 +12,7 @@ from .data.journal import Journal, RoundEntry
+ from .data.archive import Archive
+ from .data.reputation import Reputation
+ from .data import ledger
++from .budget import max_stage_cost_usd
+ from .stages.preprocess import run_stage_p
+ from .stages.plan import run_stage_1
+ from .stages.propose import run_stage_2
+@@ -127,6 +128,12 @@ class AegisOrchestrator:
+     min_actionability: float = 0.3
+     # Benchmark context string forwarded to the evolver template.
+     benchmark_context: str = ""
++    # Graded-fitness context for the Stage-4 fitness gate (see
++    # ``gates/fitness.py``). Recipes whose benchmark is scored with a continuous
++    # metric (e.g. BRIGHT's nDCG@10) pass
++    # ``{probe_qids, incumbent_scores, fitness_fn, delta, margin}``; None keeps
++    # the stock binary behaviour and the gate self-skips.
++    fitness_context: dict | None = None
+     # TODO(stage5): ``adjudicate_previous_round`` is not called from ``run_round``.
+     # Stage 5 runs ACROSS rounds in the pilot driver (not inside this class).
+     # When the pilot loop is implemented, it should call
+@@ -379,7 +386,7 @@ class AegisOrchestrator:
+             digests_dir=round_dir / "digests",
+             reputation_summary=self.reputation.to_dict(),
+             model_config=self.model_config,
+-            max_cost_usd=100.0,
++            max_cost_usd=max_stage_cost_usd(),
+             actionability_score=actionability,
+             run_root=self.run_dir,
+             sessions_dir=round_dir / "meta_sessions" / "planner",
+@@ -417,7 +424,7 @@ class AegisOrchestrator:
+             trajectories_dir=round_dir / "trajectories",
+             digests_dir=round_dir / "digests",
+             model_config=self.model_config,
+-            max_cost_usd=100.0,
++            max_cost_usd=max_stage_cost_usd(),
+             sessions_dir=round_dir / "meta_sessions" / "evolver",
+             benchmark_context=self.benchmark_context,
+         )
+@@ -481,7 +488,7 @@ class AegisOrchestrator:
+             evolver_runner=evolver_runner,
+             model_config=self.model_config,
+             max_ask_more=self.max_ask_more,
+-            max_cost_usd=100.0,
++            max_cost_usd=max_stage_cost_usd(),
+             meta_sessions_dir=round_dir / "meta_sessions" / "critic",
+         )
+         self.audit.append(
+@@ -529,6 +536,13 @@ class AegisOrchestrator:
+                 "k_samples": 3,
+             }
+         )
++        # Tier-2: wire the graded-fitness gate's context. Refreshed every round
++        # so ``incumbent_scores`` always describes the harness that is actually
++        # current — a stale incumbent would let a candidate be judged against a
++        # harness it no longer replaces.
++        from .gates.fitness import set_fitness_context
++
++        set_fitness_context(self.fitness_context)
+         # v0.9.3 IV-11: extract strategy_concern_flagged_buckets from the
+         # current round's landscape.md frontmatter (Planner relays it from
+         # the previous round's Critic decision). Gate is a no-op if the
+diff --git a/harnessx/aegis/stages/commit.py b/harnessx/aegis/stages/commit.py
+index c8eba02..a7c2177 100644
+--- a/harnessx/aegis/stages/commit.py
++++ b/harnessx/aegis/stages/commit.py
+@@ -17,6 +17,7 @@ from harnessx.aegis.gates.novelty import check_novelty
+ from harnessx.aegis.gates.canonicalize import check_canonicalize
+ from harnessx.aegis.gates.replay import check_replay_smoke
+ from harnessx.aegis.gates.counterfactual import check_counterfactual_replay
++from harnessx.aegis.gates.fitness import check_fitness_noregress
+ from harnessx.aegis.agents.evolver import parse_candidate_manifest
+ 
+ 
+@@ -93,6 +94,7 @@ async def _run_all_gates(
+             "structure": structure, "novelty": novelty,
+             "canonicalize": GateVerdict(False, _SKIP),
+             "replay": GateVerdict(False, _SKIP),
++            "fitness": GateVerdict(False, _SKIP),
+         }
+ 
+     # E1: load + canonicalize the applied YAML ONCE up front and reuse the
+@@ -151,12 +153,24 @@ async def _run_all_gates(
+                 rr = await check_replay_smoke(cfg_loaded, model_config=replay_model)
+                 replay = GateVerdict(rr.ok, rr.reason)
+ 
++    # Graded fitness gate (Tier-2 adaptation for continuous metrics). Runs LAST:
++    # it is the only gate that re-executes the harness over the probe set, so a
++    # candidate that already failed a cheap gate must never pay for it. Short-
++    # circuits ok when the recipe wired no fitness context, which is what keeps
++    # the stock binary benchmarks (GAIA/tau2/tb2) behaving exactly as before.
++    if canonical.ok and counterfactual.ok and replay.ok:
++        fv = await check_fitness_noregress(candidate_config_path)
++        fitness = GateVerdict(fv.ok, fv.reason)
++    else:
++        fitness = GateVerdict(False, _SKIP)
++
+     return {
+         "structure": structure,
+         "novelty": novelty,
+         "canonicalize": canonical,
+         "counterfactual": counterfactual,
+         "replay": replay,
++        "fitness": fitness,
+     }
+ 
+ 
+diff --git a/harnessx/aegis/stages/preprocess.py b/harnessx/aegis/stages/preprocess.py
+index b99db6f..f4186e6 100644
+--- a/harnessx/aegis/stages/preprocess.py
++++ b/harnessx/aegis/stages/preprocess.py
+@@ -18,6 +18,7 @@ from collections import defaultdict
+ from pathlib import Path
+ 
+ from ..agents.digester import build_digester_harness, DigesterInputs
++from ..budget import max_stage_cost_usd
+ from .trace_facts import extract_trace_facts
+ 
+ 
+@@ -214,9 +215,25 @@ async def _run_digester(inputs: DigesterInputs, harness) -> None:
+             f"will be discarded."
+         ),
+         max_steps=200,
+-        max_cost_usd=100.0,
++        max_cost_usd=max_stage_cost_usd(),
++    )
++    result = await harness.run(task)
++    # ``build_digester_harness`` wires no tracer, so a digester's usage reached no
++    # journal -- and every cost report therefore silently omitted the largest
++    # per-round term on a large task set (72 digesters vs ~150 meta steps). Log it
++    # here in the same ``cost=$...`` shape the other stages use so a recipe's cost
++    # capture picks it up.
++    import logging
++
++    logging.getLogger("aegis.stage_p").info(
++        "Digester %s: exit=%s steps=%s cost=$%.3f tokens=%d pattern=%s",
++        inputs.task_id,
++        getattr(result, "exit_reason", "?"),
++        len(getattr(result.trajectory, "steps", [])) if getattr(result, "trajectory", None) else "?",
++        getattr(result, "total_cost_usd", 0.0) or 0.0,
++        getattr(result, "total_tokens", 0) or 0,
++        inputs.pattern,
+     )
+-    await harness.run(task)
+ 
+ 
+ async def run_stage_p(
+diff --git a/harnessx/aegis/stages/trace_facts.py b/harnessx/aegis/stages/trace_facts.py
+index 1c50848..c6c6479 100644
+--- a/harnessx/aegis/stages/trace_facts.py
++++ b/harnessx/aegis/stages/trace_facts.py
+@@ -353,14 +353,28 @@ def extract_trace_facts(
+                 else:
+                     rmsg = result_ev.get("message") or {}
+                     rtext, structured = _content_to_text(rmsg.get("content"))
+-                    return_type = _classify_return(rtext, structured)
+-                    return_len = len(rtext)
+-                    if not next_asst_text:
++                    meta = result_ev.get("meta") or {}
++                    ext_size = meta.get("content_size") or meta.get("size")
++                    if not rtext.strip() and ext_size:
++                        # The journal externalised a large tool payload into
++                        # tool_results/<id>_raw.txt and left message.content empty.
++                        # That is NOT an empty return: the model DID receive
++                        # ext_size bytes. Without this, the Digester concludes
++                        # "empty tool return" and the Evolver then re-derives the
++                        # evidence from raw files -- measured in the BRIGHT pilot as
++                        # 200 steps, $41, pyarrow downloaded, zero candidates.
++                        return_type = "externalized"
++                        return_len = int(ext_size)
+                         next_uses = None
+-                    elif return_len < 20:
+-                        next_uses = None  # too short to tell
+                     else:
+-                        next_uses = _shares_substring(rtext, next_asst_text, min_len=20)
++                        return_type = _classify_return(rtext, structured)
++                        return_len = len(rtext)
++                        if not next_asst_text:
++                            next_uses = None
++                        elif return_len < 20:
++                            next_uses = None  # too short to tell
++                        else:
++                            next_uses = _shares_substring(rtext, next_asst_text, min_len=20)
+                 per_rollout_calls.append(
+                     ToolCallFact(
+                         rollout=rollout,
+diff --git a/harnessx/aegis/templates/evolver.md b/harnessx/aegis/templates/evolver.md
+index a6e2df4..2b87807 100644
+--- a/harnessx/aegis/templates/evolver.md
++++ b/harnessx/aegis/templates/evolver.md
+@@ -311,6 +311,50 @@ check `get_data_usage` to determine if the data cap has been exceeded."
+ Bad example: rewriting the entire troubleshooting flow or adding broad
+ "Server-side checks FIRST" guidance that conflicts with the policy's
+ prescribed order.
++{% elif benchmark_context == "bright" %}
++**CRITICAL — BRIGHT benchmark constraints.** This is a *reasoning-intensive
++retrieval* harness: it is scored by nDCG@10 over the ten document ids its final
++message returns. There is no environment to explore and no answer to phrase.
++The only thing that moves the score is **which document ids end up in that list
++and in what order**.
++
++1. `Retrieve` is the only corpus access primitive, registered as the custom tool
++   `bright_harness.tools.Retrieve`. It reads the domain corpus from a ContextVar
++   the driver binds around the run. A NEW tool or processor you ship must obtain
++   the corpus the same way:
++   `from bright_harness.tools import get_active_index` — the returned object has
++   `.search(query, k) -> list[(doc_id, score)]` and `.text_of(doc_id) -> str`.
++   Never open the corpus or any data file yourself.
++2. The final message MUST stay a JSON array of document ids, best first. A
++   processor that rewrites final output must preserve that contract: an
++   unparseable answer scores exactly 0, so "tidying up" the output can destroy
++   a working harness.
++3. **Never touch evaluation data.** `gold_ids`, qrels, `excluded_ids` and the
++   `data/bright/` tree live outside the harness. A candidate that reads them, or
++   that hard-codes document ids, ground-truth answers or dataset statistics, is
++   reward hacking and will be rejected.
++4. Prefer changes that generalise. The same harness is later evaluated, exactly
++   as shipped, on economics and robotics corpora whose documents and vocabulary
++   it has never seen. Long domain-specific term lists, hand-written synonym
++   tables and per-query special cases are a red flag: they buy biology and lose
++   everything else.
++5. The retrieval bottleneck is *reasoning*, not matching: BRIGHT queries are
++   phrased as claims or quotations while the relevant passage often uses
++   different wording. Query understanding, decomposition, reformulation,
++   multi-query fusion and reranking are the productive directions.
++6. **Deliverable contract — do not rabbit-hole.** Your entire job is to ship
++   exactly ONE candidate, which is exactly TWO files, written **in this order**,
++   then stop:
++   1. the manifest: `<candidates_dir>/C-R{{ round }}-NN.md` — this is what the gate reads;
++   2. the applied config plus any new asset files under
++      `<applied_root>/C-R{{ round }}-NN/`.
++   A round where the applied files exist but the manifest does not ships NOTHING.
++   Do NOT write exploratory scripts, do NOT `pip install` packages, and do NOT
++   read `data/bright/` or the session `tool_results/*.txt` to "verify" the
++   evidence — the digests and trajectories you were handed ARE the evidence. The
++   only verification ever warranted is a single one-liner to confirm any new code
++   imports. If you run out of steps before writing the manifest, the round is
++   wasted and the budget is gone.
+ {% endif %}
+ 
+ Final_output text alone ships nothing.
+@@ -382,6 +426,60 @@ class AppendSystemPromptProcessor(MultiHookProcessor):
+                     thinking_blocks=orig.thinking_blocks, msg_id=orig.msg_id)
+         yield event
+ ```
++{% elif benchmark_context == "bright" %}
++```yaml
++# bucket = prompt — the baseline prompt is src/bright_harness/prompts/h0_system.md.
++# `template_path` MUST point inside your own applied/<cid>/ scratch dir.
++processors:
++- _target_: harnessx.processors.context.system_prompt.SystemPromptProcessor
++  system_builder:
++    _target_: harnessx.processors.context.strategies.system_prompt.plain_markdown.PlainMarkdownSystemPromptBuilder
++    template_path: <scratch>/<name>.md
++
++# bucket = tools — H_0 has NO builtin tools, so `builtin` stays [].
++# Keep Retrieve and add your own primitive beside it. `custom` entries accept
++# either an importable "module.attr" path (@tool object) or a file:// URI.
++tool_registry:
++  builtin: []
++  custom:
++  - bright_harness.tools.Retrieve
++  - file://<scratch>/<name>.py::<symbol>
++
++# bucket = config — the retrieval policy is a REAL config surface. These five
++# kwargs live on bright_harness.processors.RetrievalPolicyProcessor in
++# R{n}/config.yaml; changing them needs no new code and is validated by the
++# canonicalize gate. The driver reads max_steps from here, so it changes how the
++# next round actually runs.
++processors:
++- _target_: bright_harness.processors.RetrievalPolicyProcessor
++  retrieve_k: 10            # passages per Retrieve call, 1..100. The tool CAPS the
++                            # model's requested k with this, so raising it is how you
++                            # attack "gold exists but is outside the returned ten".
++  snippet_chars: 600        # how much of each passage the agent sees
++  max_retrieve_calls: 1     # retrieval budget per query, enforced by the tool
++  max_steps: 4              # harness steps per query (driver reads this)
++  dedupe_by_document: false # keep only the best chunk per source document
++
++# bucket = processor — new processor class
++processors:
++- _target_: file://<scratch>/<name>.py::YourProcessor
++  some_kwarg: 30
++  _hook_: '*'
++```
++
++A tool you ship must be usable by the harness's active index, e.g.:
++
++```python
++from __future__ import annotations
++from harnessx.tools.base import tool
++from bright_harness.tools import get_active_index
++
++@tool(name="RerankByReasoning", description="Reorder candidate passages by how well they answer the request.")
++async def rerank(query: str, doc_ids: str, top_k: int = 10) -> str:
++    index = get_active_index()
++    ...  # may call the model itself? NO — tools are not model calls.
++    return "\\n".join(ranked_ids)
++```
+ {% else %}
+ ```yaml
+ # bucket = prompt
+diff --git a/harnessx/providers/openai_provider.py b/harnessx/providers/openai_provider.py
+index 70c8f35..679ae75 100644
+--- a/harnessx/providers/openai_provider.py
++++ b/harnessx/providers/openai_provider.py
+@@ -35,6 +35,40 @@ def _is_anthropic_model(model: str) -> bool:
+     return any(model.lower().startswith(p) for p in _ANTHROPIC_MODEL_PREFIXES)
+ 
+ 
++def _has_no_payload(msg: dict) -> bool:
++    """True for an assistant turn carrying neither text nor tool calls."""
++    if msg.get("role") != "assistant" or msg.get("tool_calls"):
++        return False
++    content = msg.get("content")
++    if content is None:
++        return True
++    if isinstance(content, str):
++        return not content.strip()
++    if isinstance(content, (list, tuple)):
++        return len(content) == 0
++    return False
++
++
++def _drop_empty_assistant_messages(messages: list[dict]) -> list[dict]:
++    """Remove assistant turns that have neither content nor tool_calls.
++
++    Strict providers reject them outright. DeepSeek-V4-Flash returns
++    400 "Invalid assistant message: content or tool_calls must be set", which
++    killed the AEGIS Evolver loop after 1.87M tokens (~$5.9) with 0 candidates.
++    The turn arises when a model step yields only reasoning and neither text nor
++    a tool call, so it carries nothing the next request needs. Dropping it is
++    safe for lenient providers (vLLM) too. Orphaned tool results left behind are
++    cleaned up by :func:`_fix_tool_call_pairing`, which runs immediately after.
++    """
++    kept: list[dict] = []
++    for m in messages:
++        if _has_no_payload(m):
++            logger.warning("dropping empty assistant message (no content, no tool_calls) before send")
++            continue
++        kept.append(m)
++    return kept
++
++
+ def _fix_tool_call_pairing(messages: list[dict]) -> list[dict]:
+     """Ensure tool_call/tool_result pairing is valid for the OpenAI API.
+ 
+@@ -249,6 +283,7 @@ class OpenAIProvider(BaseModelProvider):
+                 ]
+             oai_messages.append(msg)
+ 
++        oai_messages = _drop_empty_assistant_messages(oai_messages)
+         oai_messages = _fix_tool_call_pairing(oai_messages)
+ 
+         oai_tools = to_openai_tools(tools)
+@@ -343,6 +378,7 @@ class OpenAIProvider(BaseModelProvider):
+         usage = Usage(
+             input_tokens=response.usage.prompt_tokens if response.usage else 0,
+             output_tokens=response.usage.completion_tokens if response.usage else 0,
++            cache_read_tokens=_cache_hit_tokens(response.usage) if response.usage else 0,
+         )
+ 
+         return ModelResponseEvent(
+@@ -391,6 +427,7 @@ class OpenAIProvider(BaseModelProvider):
+         finish_reason = "stop"
+         input_tokens = 0
+         output_tokens = 0
++        cache_read_tokens = 0
+         # tool_calls accumulator: index -> {id, name, arguments_parts}
+         tc_accum: dict[int, dict] = {}
+ 
+@@ -398,6 +435,7 @@ class OpenAIProvider(BaseModelProvider):
+             if chunk.usage:
+                 input_tokens = chunk.usage.prompt_tokens or 0
+                 output_tokens = chunk.usage.completion_tokens or 0
++                cache_read_tokens = _cache_hit_tokens(chunk.usage)
+ 
+             if not chunk.choices:
+                 continue
+@@ -457,9 +495,31 @@ class OpenAIProvider(BaseModelProvider):
+             thinking=thinking,
+             tool_calls=tuple(tool_calls),
+             finish_reason=finish_reason,
+-            usage=Usage(input_tokens=input_tokens, output_tokens=output_tokens),
++            usage=Usage(
++                input_tokens=input_tokens,
++                output_tokens=output_tokens,
++                cache_read_tokens=cache_read_tokens,
++            ),
+             model=self.model,
+         )
+ 
+     def count_tokens(self, messages: list[Message]) -> int:
+         return count_tokens(messages)
++
++
++def _cache_hit_tokens(usage_obj: object) -> int:
++    """Prompt tokens served from the provider's prompt cache.
++
++    DeepSeek reports ``prompt_cache_hit_tokens``; OpenAI-style gateways nest the same
++    figure under ``prompt_tokens_details.cached_tokens``. The stock provider read
++    neither, so cache effectiveness was invisible -- and since RunLoop prices usage
++    with Claude Sonnet's table ($3/M in, $15/M out), the reported per-stage cost
++    overstates a DeepSeek endpoint by one to two orders of magnitude. Cache hits are
++    billed at 1/50th of a miss on DeepSeek Flash, so this number is the single biggest
++    lever on the real bill.
++    """
++    hit = getattr(usage_obj, "prompt_cache_hit_tokens", None)
++    if hit is None:
++        details = getattr(usage_obj, "prompt_tokens_details", None)
++        hit = getattr(details, "cached_tokens", None) if details else None
++    return int(hit or 0)
+diff --git a/harnessx/tools/builtin/bash.py b/harnessx/tools/builtin/bash.py
+index 0e94ba5..793e068 100644
+--- a/harnessx/tools/builtin/bash.py
++++ b/harnessx/tools/builtin/bash.py
+@@ -5,6 +5,9 @@ from __future__ import annotations
+ import asyncio
+ import os
+ import re
++import shutil
++import subprocess
++import tempfile
+ from pathlib import Path
+ 
+ from ..base import tool
+@@ -13,7 +16,27 @@ from ..base import tool
+ # an active sandbox executes with cwd = <WORK_ROOT>/<run_id>/, so files the
+ # agent creates (e.g. `cat > verify.py`) stay out of the repo. Override with
+ # the HARNESSX_WORK_DIR env var.
+-_WORK_ROOT = Path(os.environ.get("HARNESSX_WORK_DIR", "/tmp/harnessx-work"))
++#
++# Cross-platform default: a literal "/tmp/..." resolves to "\tmp\..." on Windows
++# (drive-relative), so mkdir fails with WinError 5 and EVERY Bash call dies
++# before the command runs -- which is what silently disabled the tools/processor
++# evolution buckets in the BRIGHT pilot, because the Evolver could not run its
++# mandatory build->verify loop for new code.
++_WORK_ROOT = Path(
++    os.environ.get("HARNESSX_WORK_DIR") or (Path(tempfile.gettempdir()) / "harnessx-work")
++)
++
++
++def _resolve_shell() -> str | None:
++    """Shell used by shell-mode commands.
++
++    subprocess defaults to cmd.exe on Windows, which cannot run the POSIX syntax
++    the AEGIS templates assume (`cat > f`, heredocs, `&&` chains with quoted
++    args). Set HARNESSX_BASH to a real bash (e.g. Git for Windows) or have it on
++    PATH to restore POSIX semantics; otherwise the platform default is used.
++    """
++    return os.environ.get("HARNESSX_BASH") or shutil.which("bash")
++
+ 
+ 
+ def _get_work_dir() -> str:
+@@ -126,22 +149,36 @@ async def bash_tool(command: str, timeout: int = _DEFAULT_TIMEOUT_MS) -> str:
+     # No sandbox — direct local subprocess, confined to a per-run work dir
+     # so the agent's `cat > file` / `python3 script.py` don't pollute the repo.
+     cwd = _get_work_dir()
+-    try:
+-        proc = await asyncio.create_subprocess_shell(
++    shell = _resolve_shell()
++
++    # Run the blocking call in a worker thread instead of using
++    # asyncio.create_subprocess_*. On Windows, asyncio's subprocess transport is
++    # built on NAMED pipes (windows_utils.PipeHandle -> CreateNamedPipe), and some
++    # execution environments forbid named pipes outright -- there the await fails
++    # with a bare WinError 5 (access denied) before the command ever starts, while
++    # a plain subprocess.run() with anonymous pipes succeeds. Using an executor
++    # keeps the tool usable in those environments.
++    def _run() -> tuple[int, str, str]:
++        proc = subprocess.run(
+             command,
++            shell=True,
+             cwd=cwd,
+-            stdout=asyncio.subprocess.PIPE,
+-            stderr=asyncio.subprocess.PIPE,
++            executable=shell,
++            capture_output=True,
++            timeout=timeout_sec,
+         )
+-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
+-    except asyncio.TimeoutError:
+-        try:
+-            proc.kill()
+-        except Exception:
+-            pass
++        return (
++            proc.returncode,
++            proc.stdout.decode("utf-8", errors="replace"),
++            proc.stderr.decode("utf-8", errors="replace"),
++        )
++
++    try:
++        _rc, output, errors = await asyncio.get_running_loop().run_in_executor(None, _run)
++    except subprocess.TimeoutExpired:
+         return f"Error: command timed out after {timeout_sec:.0f}s"
+-    output = stdout.decode("utf-8", errors="replace")
+-    errors = stderr.decode("utf-8", errors="replace")
++    except OSError as exc:
++        return f"Error: could not start command: {exc!r}"
+     if errors:
+         return f"{output}\nSTDERR: {errors}"
+     return output
